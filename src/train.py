@@ -12,6 +12,7 @@ import json
 from custom_models import AnimalTemporalClassifier
 from custom_models import AnimalClassifier
 from custom_datasets import S3ImageWithTimeFeatureDataset
+from custom_losses import CrossEntropyMarginLoss
 import time
 
 
@@ -71,19 +72,28 @@ def train(args):
         exit()
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.CrossEntropyLoss()
+    #criterion = nn.CrossEntropyLoss()
+    criterion = CrossEntropyMarginLoss(reduction = 'mean', margin_lambda = 0.1, margin_type="probs")
+    
 
     for epoch in range(args.epochs):
-        
+        criterion.update_params(reduction = 'mean')
         # =========DEBUG==================
         print(f"\n===========EPOCH {epoch+1}=================")
+        print(f"HYPER_PARAMETERS:")
+        print(f"--Loss Margin Lambda: {criterion.margin_lambda}")
+        print(f"--Loss Margin Format: {criterion.margin_type}")
+        
         
         
         model.train()
-        print("TRAINING started...")
+        print("TRAINING...")
+        print(f"--Train Loss Reduction: {criterion.reduction}")
         start_train = time.time()
         
         running_loss = 0.0
+        running_ce_loss = 0.0
+        
         correct_train = 0
         total_train = 0
         
@@ -94,27 +104,44 @@ def train(args):
                 outputs = model(images, features)
             else:
                 outputs = model(images)
-            loss = criterion(outputs, labels)
+            loss, ce_loss= criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            
             running_loss += loss.item() * images.size(0)
+            running_ce_loss += ce_loss.item() * images.size(0)
+            
             _, predicted = torch.max(outputs, 1)
             correct_train += (predicted == labels).sum().item()
             total_train += labels.size(0)
+        
         train_loss = running_loss / len(train_dataset)
-        train_acc = correct_train / total_train
+        train_ce_loss = running_ce_loss / len(train_dataset)
+        
+        #train_acc = correct_train / total_train
+        train_acc = correct_train / len(train_dataset)
 
         end_train = time.time()
         train_time = end_train - start_train
-        print(f"TRAINING completed: elapsed Time {train_time:.2f} seconds")
+        print(f"--done! time elapsed: {train_time:.2f} s")
+        print(f"--train_acc: {train_acc:.2f}")
+        print(f"--train_loss: {train_loss:.2f}, train_ce_loss: {train_ce_loss:.2f}")
+        
+
         
         # Validation
         model.eval()
         print("VALIDATION started....")
+        
         start_val = time.time()
+
+        criterion.update_params(reduction = 'none')
+        print(f"--Val Loss Reduction: {criterion.reduction}")
         correct = 0
         total = 0
-        running_val_loss = 0.0
+        val_loss = 0.0
+        val_ce_loss = 0.0
+        
         with torch.no_grad():
             for images, features, labels in val_loader:
                 images, features, labels = images.to(device), features.to(device), labels.to(device)
@@ -123,23 +150,36 @@ def train(args):
                 else:
                     outputs = model(images)
                 #outputs = model(images, features)
-                loss = criterion(outputs, labels)
-                running_val_loss += loss.item() * images.size(0)
+                #loss = criterion(outputs, labels)
+                
+                loss, ce_loss = criterion(outputs, labels)
+                #val_loss += loss.item() * images.size(0)
+                #val_ce_loss += ce_loss.item() * images.size(0)
+                val_loss += loss.sum().item()
+                val_ce_loss += ce_loss.sum().item()
+                
+                
                 _, predicted = torch.max(outputs, 1)
                 correct += (predicted == labels).sum().item()
                 total += labels.size(0)
-        val_loss = running_val_loss / len(val_dataset)
-        val_acc = correct / total
+        
+        val_loss = val_loss / len(val_dataset)
+        val_ce_loss = val_ce_loss / len(val_dataset)
+        
+        
+        #val_acc = correct / total
+        val_acc = correct / len(val_dataset)
 
         end_val = time.time()
         val_time = end_val - start_val
-        #print("VALIDATION end....")
-        print(f"VALIDATION completed: elapsed Time {val_time:.2f} seconds")
-
+        print(f"--done! time elapsed: {val_time:.2f} s")
+        print(f"--val_acc: {val_acc:.2f}")
+        print(f"--val_loss: {val_loss:.2f}, val_ce_loss: {val_ce_loss:.2f}")
+        
         # print accuracy and loss values
         #print(f"Epoch {epoch+1}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
-        print(f"train_loss={train_loss:.4f}, train_acc={train_acc:.4f}")
-        print(f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
+        
+        #print(f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
 
     # Save model and updated label2idx mapping
     os.makedirs(args.model_dir, exist_ok=True)
