@@ -9,13 +9,39 @@ from PIL import Image
 import s3fs
 from torchvision import transforms
 import sys
+import os
+from utils.utils import parse_s3_uri
+import boto3
+import json
 
+# add s3 session credentials to this script
 class S3ImageWithTimeFeatureDataset(Dataset):
     
-    def __init__(self, s3_csv_path, s3_label2idx_path = None):
+    def __init__(self, s3_csv_path, s3_label2idx_path = None, session = None, s3_access_profile = None, device = "mps"):
 
         # load meta data csv to process into pandas df
-        self.df = pd.read_csv(s3_csv_path)
+        #self.df = pd.read_csv(s3_csv_path)
+        # parse s3 uri to get bucket name and prefix    
+        bucket_name, prefix, filename = parse_s3_uri(s3_csv_path)
+        print(f"DEBUG input csv s3: {bucket_name}, {prefix}, {filename}")
+        # create a local temporary directory to download files
+        
+        if session is None:
+            # create a boto3 session with default profile
+            session = boto3.Session(profile_name=s3_access_profile)
+        s3_client = session.client('s3')
+
+        # download merged inferences and label mapping
+        s3_client.download_file(
+            Bucket=bucket_name,
+            #Key="data_split/train_val/validation2/evaluation/merged_inferences.csv",
+            Key = f"{prefix}/{filename}",
+            #Filename=f"{local_tmp_dir}/merged_inferences.csv"
+            Filename = filename
+        )
+        self.df = pd.read_csv(filename)
+
+        print(f"DEBUG INFO: self.df.shape = {self.df.shape}")
 
         # transform an input Image into a Tensor then normalize
         self.transform = transforms.Compose([
@@ -24,15 +50,45 @@ class S3ImageWithTimeFeatureDataset(Dataset):
         ])
 
         # initialize s3fs access 
-        self.fs = s3fs.S3FileSystem()
+        #self.fs = s3fs.S3FileSystem()
+        credentials = session.get_credentials().get_frozen_credentials()
+        self.fs = s3fs.S3FileSystem(
+            key=credentials.access_key,
+            secret=credentials.secret_key,
+            token=credentials.token,
+            client_kwargs={
+                'region_name': session.region_name
+            }
+        )
+
+        print(f"DEBUG INFO: self.fs OK")
 
         # if label2idx path is given, it is assumed that label encoding is required
         if s3_label2idx_path is None:
             print("DEBUG INFO: No Label Encoding needed for this dataset")
             self.label2idx = None
         else:
-            label2idx = pd.read_json(s3_label2idx_path, typ='series')
+            #label2idx = pd.read_json(s3_label2idx_path, typ='series')
+            #self.label2idx = label2idx
+
+            bucket_name, prefix, filename = parse_s3_uri(s3_label2idx_path)
+            print(f"DEBUG label mapping json s3: {bucket_name}, {prefix}, {filename}")
+            s3_client.download_file(
+                Bucket=bucket_name,
+                Key = f"{prefix}/{filename}",
+                Filename = filename
+            )
+            #print("DEBUG CHECK: S3 CLIENT DOWNLOAD: (tmp_label_mapping.json) OK")
+            with open(filename, "r") as f:
+                label2idx = json.load(f)
             self.label2idx = label2idx
+            print(f"DEBUG INFO: self.label2idx = {self.label2idx}")
+        print(f"DEBUG INFO: self.label2idx OK")
+
+        self.device = torch.device(device)
+        print(f"DEBUG INFO: Dataset initialized with device {self.device}")
+
+
 
     def __len__(self):
         return len(self.df)
@@ -58,3 +114,4 @@ class S3ImageWithTimeFeatureDataset(Dataset):
             label_enc_tensor = torch.tensor(self.label2idx[row['label']], dtype=torch.long)
         
         return image_tensor, temporal_tensor, label_enc_tensor
+        #return image_tensor.to(self.device), temporal_tensor.to(self.device), label_enc_tensor.to(self.device)
