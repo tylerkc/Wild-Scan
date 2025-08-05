@@ -44,7 +44,7 @@ class CrossEntropyMarginLoss(nn.Module):
         # combine ce_loss and effect of margin maximization
         loss = ce_loss + self.margin_lambda * margin_penalty
         
-        return loss, ce_loss
+        return loss
 
     def update_params(self, reduction = None, margin_lambda=None, margin_type=None):
         """Dynamically update loss hyperparameters."""
@@ -56,3 +56,7 @@ class CrossEntropyMarginLoss(nn.Module):
         if margin_type is not None:
             assert margin_type in ("logits", "probs"), "Invalid margin_type"
             self.margin_type = margin_type
+
+    # add name
+    def __name__(self):
+        return f"CrossEntropyMarginLoss(margin_lambda={self.margin_lambda}, margin_type={self.margin_type})"
