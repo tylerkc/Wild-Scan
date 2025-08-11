@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import logging
+import torch.nn as nn, torch.nn.functional as F
 
 
 logging.basicConfig(
@@ -13,6 +14,67 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(funcName)s() - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# --- Scratch ResNet (small) ---------------------------------------------------
+class ResidualBlock(nn.Module):
+    def __init__(self, in_c, out_c, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_c, out_c, 3, stride, 1, bias=False)
+        self.bn1   = nn.BatchNorm2d(out_c)
+        self.conv2 = nn.Conv2d(out_c, out_c, 3, 1, 1, bias=False)
+        self.bn2   = nn.BatchNorm2d(out_c)
+        self.down  = downsample
+
+    def forward(self, x):
+        identity = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.down: identity = self.down(x)
+        return F.relu(out + identity)
+
+class ScratchResNet(nn.Module):
+    """
+    A compact ResNet-ish model:
+      stem -> [64, 128, 256, 512] residual stages (2 blocks each) -> GAP -> FC
+    """
+    def __init__(self, num_classes, name: str = "ScratchResNet"):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 64, 7, 2, 3, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.MaxPool2d(3, 2, 1)
+        )
+        self.layer1 = self._make_layer(64, 64, 2)
+        self.layer2 = self._make_layer(64,128,2, stride=2)
+        self.layer3 = self._make_layer(128,256,2, stride=2)
+        self.layer4 = self._make_layer(256,512,2, stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc      = nn.Linear(512, num_classes)
+        self.use_temporal_features = False
+        self.name = name
+
+    def _make_layer(self, in_c, out_c, blocks, stride=1):
+        # First block may downsample; subsequent blocks keep same shape.
+        down = None
+        if stride!=1 or in_c!=out_c:
+            down = nn.Sequential(
+                nn.Conv2d(in_c, out_c, 1, stride, bias=False),
+                nn.BatchNorm2d(out_c)
+            )
+        layers = [ResidualBlock(in_c, out_c, stride, down)]
+        for _ in range(1, blocks):
+            layers.append(ResidualBlock(out_c, out_c))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.stem(x)
+        for layer in (self.layer1,self.layer2,self.layer3,self.layer4):
+            x = layer(x)
+        x = self.avgpool(x).view(x.size(0), -1)
+        return self.fc(x)
+    
+    def __name__(self):
+        return self.name
 
 class CustomClassifier(nn.Module):
     # to add custom classifier later
@@ -40,7 +102,7 @@ class CustomClassifier(nn.Module):
 
 class AnimalClassifier(nn.Module):
     
-    def __init__(self, num_classes, name: str = "AnimalClassifier_ResNet18"):
+    def __init__(self, num_classes, pretrained = True, name: str = "AnimalClassifier_ResNet18"):
         super().__init__()
 
         # assign custom attribute
@@ -48,7 +110,9 @@ class AnimalClassifier(nn.Module):
         self.name = name
         
         # Pretrained ResNet18 backbone
-        self.cnn = models.resnet18(pretrained=True)
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        self.cnn = models.resnet18(weights=weights)
+        #self.cnn = models.resnet18(pretrained=True)
         cnn_out_dim = self.cnn.fc.in_features # ResNet18 last layer output size (512)
         self.cnn.fc = nn.Linear(cnn_out_dim, num_classes)
         
@@ -94,7 +158,7 @@ class WrapperModel(nn.Module):
 
 class AnimalTemporalClassifier(nn.Module):
     
-    def __init__(self, num_classes, proj_dim = 256, name: str = "AnimalTemporalClassifier_ResNet18"):
+    def __init__(self, num_classes, proj_dim = 256, pretrained = True, name: str = "AnimalTemporalClassifier_ResNet18"):
         super().__init__()
 
         # assign custom attributes
@@ -102,7 +166,9 @@ class AnimalTemporalClassifier(nn.Module):
         self.name = name
         
         # Pretrained ResNet18 backbone
-        self.cnn = models.resnet18(pretrained=True)
+        
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        self.cnn = models.resnet18(weights=weights)
         cnn_out_dim = self.cnn.fc.in_features # ResNet18 last layer output size (512)
         self.cnn.fc = nn.Identity()  # remove fc layer Output: [batch, 512]
         

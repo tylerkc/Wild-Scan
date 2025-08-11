@@ -233,6 +233,12 @@ class WildScanTrainer:
                     
 
         logger.info("Training complete.")
+        # set the model weights to the best model weights
+        if self.best_model_weights is not None:
+            self.model.load_state_dict(self.best_model_weights)
+            logger.info("Loaded best model weights from training.")
+        else:
+            logger.warning("No best model weights found, using final model weights.")
 
     def plot_metrics(self):
         plt.figure(figsize=(14, 6))

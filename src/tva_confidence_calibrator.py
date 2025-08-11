@@ -21,7 +21,7 @@ class TvACalibrator:
     This class implements the TvA approach that reformulates multiclass 
     calibration as a single binary classification problem.
     """
-    def __init__(self, method='temperature_scaling', n_bins=15, lambda_reg=0.01):
+    def __init__(self, method='histogram_binning', n_bins=15, lambda_reg=0.01):
         
         # Initialize TvA calibrator.
         """
@@ -41,7 +41,7 @@ class TvACalibrator:
         # logits: shape (num_samples, num_classes)
         top_idx = np.argmax(logits, axis=1)
         top_logits = logits[np.arange(logits.shape[0]), top_idx]
-        
+    #    
         # log-sum-exp over all *other* classes
         mask = np.ones_like(logits, dtype=bool)
         mask[np.arange(logits.shape[0]), top_idx] = False
@@ -105,6 +105,8 @@ class TvACalibrator:
             self.calibrator = TvAHistogramBinning(n_bins=self.n_bins)
             #self.calibrator.fit(confidence_scores.cpu().numpy(), binary_labels.cpu().numpy())
             self.calibrator.fit(tva_scores.cpu().numpy(), binary_labels.cpu().numpy())
+        
+       
             
         elif self.method == 'isotonic_regression':
             self.calibrator = TvAIsotonicRegression()
@@ -114,8 +116,16 @@ class TvACalibrator:
             raise ValueError(f"Unsupported calibration method: {self.method}")
             
         self.is_fitted = True
+        return self
     
-    def predict_proba(self, logits):
+    def identify_uncertain_samples(self, confidences: torch.Tensor, 
+                                 confidence_threshold: float = 0.8) -> np.ndarray:
+        """Identify uncertain samples based on confidence threshold"""
+        #max_probs = torch.max(confidences, dim=1)[0]
+        uncertain_mask = confidences < confidence_threshold
+        return uncertain_mask.cpu().numpy()
+    
+    def transform(self, logits):
         """
         Apply TvA calibration to get calibrated confidence scores.
         
@@ -126,17 +136,24 @@ class TvACalibrator:
             torch.Tensor: Calibrated confidence scores
         """
         if not self.is_fitted:
-            raise ValueError("Calibrator must be fitted before making predictions")
+            # Convert logits to probabilities
+            probs = F.softmax(logits, dim=1)
+        
+            # Get confidence scores (max probabilities) and predictions
+            max_softmax_probs, _ = torch.max(probs, dim=1)
+            return max_softmax_probs
+            #raise ValueError("Calibrator must be fitted before making predictions")
             
         if self.method in ['temperature_scaling', 'vector_scaling']:
-            return self.calibrator.predict_proba(logits)
+            return self.calibrator.transform(logits)
         else:
             # For binary methods, we only need confidence scores
-            probs = F.softmax(logits, dim=1)
-            confidence_scores, _ = torch.max(probs, dim=1)
-            
-            calibrated_confidences = self.calibrator.predict_proba(confidence_scores.cpu().numpy())
-            return torch.from_numpy(calibrated_confidences).float()
+            #probs = F.softmax(logits, dim=1)
+            #confidence_scores, _ = torch.max(probs, dim=1)
+            confidence_scores,_ = self._tva_max_confidences(logits.cpu().numpy())
+            #calibrated_confidences = self.calibrator.transform(confidence_scores.cpu().numpy())
+            calibrated_confidences = self.calibrator.transform(confidence_scores)
+            return calibrated_confidences
 
 class TvATemperatureScaling(nn.Module):
     """
@@ -182,7 +199,7 @@ class TvATemperatureScaling(nn.Module):
         optimizer.step(eval_loss)
         #self.is_fitted = True
         
-    def predict_proba(self, logits):
+    def transform(self, logits):
         """Apply temperature scaling and return calibrated confidence scores."""
         with torch.no_grad():
             scaled_logits = logits / self.temperature
@@ -230,7 +247,7 @@ class TvAVectorScaling(nn.Module):
         
         optimizer.step(eval_loss)
         
-    def predict_proba(self, logits):
+    def transform(self, logits):
         """Apply vector scaling and return calibrated confidence scores."""
         with torch.no_grad():
             scaled_logits = logits / self.temperature_vector.unsqueeze(0)
@@ -238,25 +255,26 @@ class TvAVectorScaling(nn.Module):
             confidence_scores, _ = torch.max(probs, dim=1)
             return confidence_scores
 
-class TvAHistogramBinning:
+#class TvAHistogramBinning:
     """
     TvA Histogram Binning for binary calibration.
     """
     
-    def __init__(self, n_bins=15, strategy='quantile'):
-        self.n_bins = n_bins
-        self.strategy = strategy  # 'uniform' or 'quantile'
-        self.bin_boundaries = None
-        self.bin_calibrated_probs = None
+ #   def __init__(self, n_bins=15, strategy='uniform'):
+ #       self.n_bins = n_bins
+ #       self.strategy = strategy  # 'uniform' or 'quantile'
+ #       self.bin_boundaries = None
+ #       self.bin_calibrated_probs = None
         
-    def fit(self, confidence_scores, binary_labels):
-        """
-        Fit histogram binning calibrator.
+ #   def fit(self, confidence_scores, binary_labels):
+ #       """
+ #       Fit histogram binning calibrator.
         
-        Args:
-            confidence_scores (np.array): Confidence scores from model
-            binary_labels (np.array): Binary correctness labels
-        """
+ #       Args:
+ #           confidence_scores (np.array): Confidence scores from model
+ #           binary_labels (np.array): Binary correctness labels
+ #       """
+    """
         if self.strategy == 'uniform':
             # Equal-width bins
             print("DEBUG: histogram binning uniform")
@@ -288,20 +306,21 @@ class TvAHistogramBinning:
             else:
                 # If no samples in bin, use bin midpoint as default
                 self.bin_calibrated_probs[i] = (lower + upper) / 2
-                
-    def predict_proba(self, confidence_scores):
-        """Apply histogram binning calibration."""
-        calibrated_probs = np.zeros_like(confidence_scores)
-        
-        for i in range(len(confidence_scores)):
-            # Find which bin this confidence score belongs to
-            bin_idx = np.digitize(confidence_scores[i], self.bin_boundaries) - 1
-            bin_idx = np.clip(bin_idx, 0, self.n_bins - 1)  # Ensure valid index
-            
-            calibrated_probs[i] = self.bin_calibrated_probs[bin_idx]
-            
-        return calibrated_probs
+    """
 
+    #def predict_proba(self, confidence_scores):
+     #   """Apply histogram binning calibration."""
+     #   calibrated_probs = np.zeros_like(confidence_scores)
+        
+     #   for i in range(len(confidence_scores)):
+            # Find which bin this confidence score belongs to
+     #       bin_idx = np.digitize(confidence_scores[i], self.bin_boundaries) - 1
+     #       bin_idx = np.clip(bin_idx, 0, self.n_bins - 1)  # Ensure valid index
+            
+     #       calibrated_probs[i] = self.bin_calibrated_probs[bin_idx]
+            
+     #   return calibrated_probs
+    
 class TvAIsotonicRegression:
     """
     TvA Isotonic Regression for binary calibration.
@@ -314,9 +333,100 @@ class TvAIsotonicRegression:
         """Fit isotonic regression calibrator."""
         self.isotonic_regressor.fit(confidence_scores, binary_labels)
         
-    def predict_proba(self, confidence_scores):
+    def transform(self, confidence_scores):
         """Apply isotonic regression calibration."""
         return self.isotonic_regressor.predict(confidence_scores)
+
+class TvAHistogramBinning:
+    """
+    Custom TvA Histogram Binning implementation that works properly
+    """
+    
+    def __init__(self, n_bins=15, equal_mass=True):
+        self.n_bins = n_bins
+        self.equal_mass = equal_mass
+        self.bin_boundaries = None
+        self.bin_calibrated_probs = None
+        self.fitted = False
+        
+    def fit(self, max_confidences, correctness_labels):
+        """Fit the TvA calibrator"""
+        max_confidences = np.array(max_confidences).flatten()
+        correctness_labels = np.array(correctness_labels).flatten()
+        
+        n_samples = len(max_confidences)
+        
+        if self.equal_mass:
+            # Equal-mass binning: each bin has approximately same number of samples
+            sorted_indices = np.argsort(max_confidences)
+            samples_per_bin = n_samples // self.n_bins
+            remainder = n_samples % self.n_bins
+            
+            self.bin_boundaries = [max_confidences.min()]
+            current_idx = 0
+            
+            for bin_idx in range(self.n_bins - 1):
+                bin_size = samples_per_bin + (1 if bin_idx < remainder else 0)
+                current_idx += bin_size
+                if current_idx < len(sorted_indices):
+                    boundary = max_confidences[sorted_indices[current_idx - 1]]
+                    self.bin_boundaries.append(boundary)
+            
+            self.bin_boundaries.append(max_confidences.max())
+            self.bin_boundaries = np.array(self.bin_boundaries)
+            
+            # Handle duplicate boundaries
+            for i in range(1, len(self.bin_boundaries)):
+                if self.bin_boundaries[i] <= self.bin_boundaries[i-1]:
+                    self.bin_boundaries[i] = self.bin_boundaries[i-1] + 1e-8
+        else:
+            # Equal-width binning
+            self.bin_boundaries = np.linspace(max_confidences.min(), 
+                                            max_confidences.max(), self.n_bins + 1)
+        
+        # Update n_bins in case we had to adjust
+        self.n_bins = len(self.bin_boundaries) - 1
+        
+        # Calculate calibrated probability for each bin
+        self.bin_calibrated_probs = np.zeros(self.n_bins)
+        
+        for i in range(self.n_bins):
+            if i == self.n_bins - 1:
+                mask = (max_confidences >= self.bin_boundaries[i]) & \
+                       (max_confidences <= self.bin_boundaries[i + 1])
+            else:
+                mask = (max_confidences >= self.bin_boundaries[i]) & \
+                       (max_confidences < self.bin_boundaries[i + 1])
+            
+            if np.sum(mask) > 0:
+                self.bin_calibrated_probs[i] = np.mean(correctness_labels[mask])
+            else:
+                # Fallback for empty bins
+                self.bin_calibrated_probs[i] = (self.bin_boundaries[i] + self.bin_boundaries[i + 1]) / 2
+        
+        self.fitted = True
+        return self
+        
+    def transform(self, max_confidences):
+        """Apply TvA calibration"""
+        if not self.fitted:
+            raise ValueError("Calibrator must be fitted before transform")
+            
+        max_confidences = np.array(max_confidences).flatten()
+        calibrated_confidences = np.zeros_like(max_confidences)
+        
+        for i, conf in enumerate(max_confidences):
+            if conf <= self.bin_boundaries[0]:
+                bin_idx = 0
+            elif conf >= self.bin_boundaries[-1]:
+                bin_idx = self.n_bins - 1
+            else:
+                bin_idx = np.searchsorted(self.bin_boundaries[1:], conf, side='right')
+                bin_idx = min(bin_idx, self.n_bins - 1)
+            
+            calibrated_confidences[i] = self.bin_calibrated_probs[bin_idx]
+        
+        return calibrated_confidences
 
 # Evaluation utilities for TvA calibration
 class TvAEvaluator:
@@ -385,3 +495,98 @@ class TvAEvaluator:
                 bin_counts.append(0)
                 
         return bin_centers, np.array(bin_accuracies), np.array(bin_confidences), np.array(bin_counts)
+
+
+class TvAHistogramCalibrator:
+    """
+    Top-versus-All Histogram Binning Calibrator
+    
+    Transforms multi-class calibration into single binary problem:
+    "Is the prediction correct?" vs "Is it class X?" for each class.
+    """
+    
+    def __init__(self, n_bins=10, equal_intervals=False):
+        self.n_bins = n_bins
+        self.equal_intervals = equal_intervals
+        self.bin_boundaries = None
+        self.bin_values = None
+        self.is_fitted = False
+    
+    def fit(self, pred_logits, true_labels):
+        """Fit calibrator using validation data"""
+        # Convert logits to probabilities
+        #if np.any(pred_logits < 0) or not np.allclose(np.sum(pred_logits, axis=1), 1):
+        #exp_logits = np.exp(pred_logits - np.max(pred_logits, axis=1, keepdims=True))
+        #probabilities = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+        #else:
+        #    probabilities = pred_logits
+        probabilities = F.softmax(pred_logits, dim=1).numpy()
+        # TvA Transformation: confidence vs correctness
+        max_probs = np.max(probabilities, axis=1)
+        pred_classes = np.argmax(probabilities, axis=1)
+        is_correct = (pred_classes == true_labels).astype(float)
+        
+        # Create bins for confidence scores
+        if self.equal_intervals:
+            self.bin_boundaries = np.linspace(0, 1, self.n_bins + 1)
+        else:
+            self.bin_boundaries = np.quantile(max_probs, np.linspace(0, 1, self.n_bins + 1))
+            self.bin_boundaries[0] = 0.0
+            self.bin_boundaries[-1] = 1.0
+        
+        self.bin_boundaries = np.unique(self.bin_boundaries)
+        n_actual_bins = len(self.bin_boundaries) - 1
+        self.bin_values = np.zeros(n_actual_bins)
+        
+        # Calculate empirical accuracy for each bin
+        for i in range(n_actual_bins):
+            if i == n_actual_bins - 1:
+                in_bin = (max_probs >= self.bin_boundaries[i]) & \
+                        (max_probs <= self.bin_boundaries[i + 1])
+            else:
+                in_bin = (max_probs >= self.bin_boundaries[i]) & \
+                        (max_probs < self.bin_boundaries[i + 1])
+            
+            if np.sum(in_bin) > 0:
+                self.bin_values[i] = np.mean(is_correct[in_bin])
+            else:
+                self.bin_values[i] = (self.bin_boundaries[i] + self.bin_boundaries[i + 1]) / 2
+        
+        self.is_fitted = True
+        return self
+    
+    def predict_proba(self, pred_logits):
+        """Apply TvA calibration to new predictions"""
+        if not self.is_fitted:
+            raise ValueError("Must call fit() before predict_proba()")
+        
+        # Convert to probabilities
+        #if np.any(pred_logits < 0) or not np.allclose(np.sum(pred_logits, axis=1), 1):
+        #    exp_logits = np.exp(pred_logits - np.max(pred_logits, axis=1, keepdims=True))
+        #    probabilities = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+        #else:
+        #    probabilities = pred_logits
+        probabilities = F.softmax(pred_logits, dim=1).numpy()
+        max_probs = np.max(probabilities, axis=1)
+        
+        # Map confidences to calibrated values
+        calibrated_confidences = np.zeros_like(max_probs)
+        for i in range(len(self.bin_boundaries) - 1):
+            if i == len(self.bin_boundaries) - 2:
+                in_bin = (max_probs >= self.bin_boundaries[i]) & \
+                        (max_probs <= self.bin_boundaries[i + 1])
+            else:
+                in_bin = (max_probs >= self.bin_boundaries[i]) & \
+                        (max_probs < self.bin_boundaries[i + 1])
+            calibrated_confidences[in_bin] = self.bin_values[i]
+        
+        # Scale probabilities while preserving class rankings
+        scaling_factors = np.divide(calibrated_confidences, max_probs, 
+                                  out=np.ones_like(max_probs), where=(max_probs > 1e-8))
+        calibrated_probs = probabilities * scaling_factors[:, np.newaxis]
+        
+        # Renormalize
+        row_sums = np.sum(calibrated_probs, axis=1, keepdims=True)
+        calibrated_probs = calibrated_probs / row_sums
+        
+        return calibrated_probs, calibrated_confidences

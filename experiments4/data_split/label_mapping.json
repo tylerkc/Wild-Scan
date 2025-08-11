@@ -1,0 +1,16 @@
+{
+    "car": 0,
+    "coyote": 1,
+    "dog": 2,
+    "bobcat": 3,
+    "rabbit": 4,
+    "deer": 5,
+    "opossum": 6,
+    "raccoon": 7,
+    "squirrel": 8,
+    "cat": 9,
+    "bird": 10,
+    "skunk": 11,
+    "rodent": 12,
+    "fox": 13
+}

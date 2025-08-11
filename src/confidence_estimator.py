@@ -1,3 +1,10 @@
+# WildScan Project Predictive Confidence Estimation Module
+# AAI-590 Group 9
+# Multi-Class Prediction Confidence Calibration Module Based on Top-Versus-All Method
+# Reference: https://arxiv.org/pdf/2411.02988v2
+# Base Code: Perplexity (July 2025)
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,8 +21,10 @@ class ConfidenceEstimator:
         super().__init__()
         self.num_classes = num_classes
         self.calibration_method = calibration_method
-        self.tva_calibrator = tva_calibrator.TvACalibrator(method=calibration_method, n_bins = n_bins)
+        self.n_bins = n_bins
+        self.tva_calibrator = tva_calibrator.TvACalibrator(method=self.calibration_method, n_bins = self.n_bins)
         self.is_calibrated = False
+        
         self.reset_statistics()
         
     def reset_statistics(self):
@@ -35,16 +44,16 @@ class ConfidenceEstimator:
             'entropy': []
         } for i in range(self.num_classes)}
     
-    def calibrate(self, validation_logits, validation_labels):
+    def calibrate(self, validation_logits, validation_true_labels):
         """
         Calibrate the confidence estimator using validation data.
         
         Args:
             validation_logits (torch.Tensor): Logits from validation set
-            validation_labels (torch.Tensor): True labels for validation set
+            validation_true_labels (torch.Tensor): True labels for validation set
         """
         print(f"Calibrating confidence estimator using TvA {self.calibration_method}...")
-        self.tva_calibrator.fit(validation_logits, validation_labels)
+        self.tva_calibrator.fit(validation_logits, validation_true_labels)
         self.is_calibrated = True
         print("Calibration complete!")
         
@@ -66,7 +75,7 @@ class ConfidenceEstimator:
 
         # 4. TvA calibrated confidence
         if self.is_calibrated:
-            calibrated_confidence = self.tva_calibrator.predict_proba(logits)
+            calibrated_confidence = self.tva_calibrator.transform(logits)
         else:
             calibrated_confidence = max_probs  # Fallback to original if not calibrated
             warnings.warn("Confidence estimator not calibrated. Using original confidence scores.")
@@ -79,26 +88,31 @@ class ConfidenceEstimator:
         max_probs, margins, entropy, predictions, calibrated_confidence = self.compute_confidence_scores(logits)
         
         # Update global statistics
-        self.global_stats['calibrated_confidence'].extend(calibrated_confidence.cpu().numpy())
-        self.global_stats['original_confidence'].extend(max_probs.cpu().numpy())
-        self.global_stats['max_prob'].extend(max_probs.cpu().numpy())
-        self.global_stats['margin'].extend(margins.cpu().numpy())
-        self.global_stats['entropy'].extend(entropy.cpu().numpy())
-        
+        #self.global_stats['calibrated_confidence'].extend(calibrated_confidence.cpu().numpy())
+        #self.global_stats['original_confidence'].extend(max_probs.cpu().numpy())
+        #self.global_stats['max_prob'].extend(max_probs.cpu().numpy())
+        #self.global_stats['margin'].extend(margins.cpu().numpy())
+        #self.global_stats['entropy'].extend(entropy.cpu().numpy())
+
+        self.global_stats['calibrated_confidence'].extend(calibrated_confidence)
+        self.global_stats['original_confidence'].extend(max_probs)
+        self.global_stats['max_prob'].extend(max_probs)
+        self.global_stats['margin'].extend(margins)
+        self.global_stats['entropy'].extend(entropy)
         # Update per-class statistics
         for class_idx in range(self.num_classes):
             mask = predictions == class_idx
             if mask.any():
                 self.class_stats[class_idx]['calibrated_confidence'].extend(
-                    calibrated_confidence[mask].cpu().numpy())
+                    calibrated_confidence[mask])
                 self.class_stats[class_idx]['original_confidence'].extend(
-                    max_probs[mask].cpu().numpy())
+                    max_probs[mask])
                 self.class_stats[class_idx]['max_prob'].extend(
-                    max_probs[mask].cpu().numpy())
+                    max_probs[mask])
                 self.class_stats[class_idx]['margin'].extend(
-                    margins[mask].cpu().numpy())
+                    margins[mask])
                 self.class_stats[class_idx]['entropy'].extend(
-                    entropy[mask].cpu().numpy())
+                    entropy[mask])
     
     def get_confidence_report(self):
         """Generate comprehensive confidence statistics report"""
