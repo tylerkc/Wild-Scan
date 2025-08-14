@@ -144,6 +144,7 @@ def plot_monthly_class_distribution(input_df, feature_name = 'label', production
         
     
     plt.show()
+    return ax, ax2
 
 # plot distribution change in the previous three months for every month in the given df 
 

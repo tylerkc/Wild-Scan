@@ -1,5 +1,6 @@
 # AAI-590 Group 9
-# Evaluator module use in wildscan ml system and pretraining pipeline
+# Supervised Metrics Evaluator module use in wildscan ml system, pretraining and production simulation pipelines
+# 
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -42,12 +43,14 @@ class WildScanEvaluator:
         self.pred_probs = None
         self.pred_labels = None
         self.true_labels = None
+        self.pred_logits = None  # Store logits for later use if needed
 
 
     def _predict_all(self):
         # predict all data in the test_loader
         self.model.eval()
         all_probs, all_preds, all_labels = [], [], []
+        all_logits = []  # Store logits for later use if needed
         with torch.no_grad():
             for images, features, labels in self.test_loader:
                 images, features, labels = images.to(self.device), features.to(self.device), labels.to(self.device)
@@ -63,13 +66,15 @@ class WildScanEvaluator:
                 probs = torch.softmax(outputs, dim=1)
                 preds = torch.argmax(probs, dim=1)
                 
+                all_logits.append(outputs.cpu().numpy())  # Store logits if needed later
                 all_probs.append(probs.cpu().numpy())
                 all_preds.append(preds.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
         return (
             np.concatenate(all_preds),
             np.concatenate(all_probs),
-            np.concatenate(all_labels)
+            np.concatenate(all_labels),
+            np.concatenate(all_logits)
         )
 
     def evaluate(self, test_loader:DataLoader=None):
@@ -77,17 +82,26 @@ class WildScanEvaluator:
         self.test_loader = test_loader if test_loader is not None else self.test_loader
 
         # make predictions
-        y_pred, y_prob, y_true = self._predict_all()
+        y_pred, y_prob, y_true, y_logits = self._predict_all()
         
         # Store predictions for later use
         self.pred_probs = y_prob 
         self.pred_labels = y_pred # scalar
         self.true_labels = y_true # scaler
+        self.pred_logits = y_logits # logits
 
         print(f"\n=== MODEL {self.model.name} ===")
         acc = accuracy_score(y_true, y_pred)
         f1_macro = f1_score(y_true, y_pred, average='macro')
-        roc_auc = roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro')
+        present_classes = np.unique(y_true)
+        logger.info(f"Present classes in evaluation set: {present_classes}")
+        if len(present_classes) != len(self.idx2label):
+            logger.warning(f"Mismatch between present classes in evaluation set and model label mapping. "
+                           f"Present classes: {present_classes}, Model classes: {self.idx2label.keys()}")
+            #y_prob /= y_prob.sum(axis=1, keepdims=True)  # Softmax: each row sums to 1
+            roc_auc = 'not available'
+        else:
+            roc_auc = roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro')
 
         full_class_indices = list(self.idx2label.keys())  # all class indices in the model
         unique_classes = np.unique(y_true) # unique classes in evaluation set
@@ -124,6 +138,7 @@ class WildScanEvaluator:
         plt.title('ROC Curve')
         plt.legend()
         plt.show()
+        return self
 
     
     def check_robustness(self):

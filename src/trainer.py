@@ -212,6 +212,7 @@ class WildScanTrainer:
                 logger.info(f"Updated learning rate to {self.optimizer.param_groups[0]['lr']:.6f}")
 
             # Early stopping when validation loss does not improve
+            
 
             # Append loss and accuracy to training history
             self.training_history['train_loss'].append(train_loss)

@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 
 import logging
 # Set up logging
@@ -187,62 +187,66 @@ class ProductionConfig:
     # General settings
     project_name: str = "WildScan_MLSystem"
     experiment_name: str = "Production Simulation"
+
     
     # get device whether it's cuda, cpu, or mps
     device: str = '' # updated to what is available during initialization 
-    
-    
-    
-    # Meta_Data paths
-    train_data_path: str = ""
-    val_data_path: str = ""
-    test_data_path: str = ""
-    ood_data_path: str = ""
-    
-    production_data_path: str = ""
-    production_ood_data_path: str = ""
-    calibration_data_path: str = ""
 
-    production_predictions_path: str ="",
-
-    # Preprocessed images path
-    preprocessed_images_path: str = "./preprocessed_images"
-
+    # baseline model id to initialize the model weights - specific to this project
     # Models Configurations
     model_configs: Dict[int, Dict] = field(default_factory=lambda:MODELS_DICT)
+    baseline_model_id: int = 0  # default to the first model in the models_dict
+
+    # paths to current datasets to process in this current time interval
+    new_data_dir: str = "./production/new_data/"
+    #production_data_path: str = "" # in-location, in-time interval
+    #production_ood_data_path:str = "" # out-location, in-time interval
+
+    # paths to previous update's data including most recent model weights
+    # contains most rcent model weights, last time interval's in-loc & out-loc data, and calibration data
+    last_update_data_dir: str =  "./production/last_update_data/",  
+
+    # Preprocessed images path
+    preprocessed_images_path: str = ""
+
+    # Models Configurations
+    #model_configs: Dict[int, Dict] = field(default_factory=lambda:MODELS_DICT)
 
     # label mapping path
     label2idx_path: str = "./label2idx.json"
 
     
     #update_num_classes_from_label2idx()
-    models_to_use: List[int]  = field(default_factory=lambda:[0, 1, 2])  # which models to use from model_configs
+    #models_to_use: List[int]  = field(default_factory=lambda:[0, 1, 2])  # which models to use from model_configs
 
     # model training output dir
     training_output_dir: str = "./pretrained_models"
     
-    # TrainerClass Settings Default
-    
-    batch_size: int = 32
+    # Fine-Tuning Settings for Production 
+    fine_tune_batch_size: int = 32
     learning_rate: float = 1e-4
     weight_decay: float = 5e-4
     patience: int = 3
     epochs: int = 10
+    
     criterion: nn.Module = CrossEntropyMarginLoss(reduction='mean', margin_lambda=0.1, margin_type="logits")
     
     # Criterion Settings# Batch Inference Batch Size (Depends on GPU memory)
     inference_batch_size: int =128
 
-    # confidence estimation settings
-    confidence_threshold: float = 0.8 # by default
-    # Pipeline settings
-    enable_pretraining_pipeline: bool = True
-    enable_production_pipeline: bool = True
+    # confidence threshold for uncertainty sampling and human annotation task
+    confidence_threshold: float = 0.87 # by default
 
+    # tmp directory for storing intermediate results (may delete later)
+    tmp_output_dir: str = "./production/tmp_outputs",
+
+    # historical data dir
+    historical_data_dir: str = "./production/historical_data",
+    
     
     # Logging and output
-    output_dir: str = "./outputs"
-    log_level: str = "INFO"
+    #output_dir: str = "./production/tmp_outputs"
+    #log_level: str = "INFO"
     
 
 
@@ -339,7 +343,7 @@ class PretrainingPipeline:
             models_to_use = self.config.models_to_use
         
         # log number of models to setup based on models_to_use
-        model_configs = {k: v for k, v in model_configs.items() if k in models_to_use}
+        model_configs = {k: v for k, v in model_configs.items() if k in models_to_use}.copy()
         self.logger.info(f"Setting up {len(model_configs)} models...")
         
         for model_id, model_config in model_configs.items():
@@ -561,6 +565,7 @@ class PretrainingPipeline:
             logger.error(f"Pretraining pipeline failed: {e}")
             raise
 
+
 class ProductionPipeline:
     """
     Pipeline for production simulation, deployment testing, and monitoring.
@@ -571,7 +576,7 @@ class ProductionPipeline:
         self.config = config
         self.logger = logging.getLogger(__name__ + ".ProductionPipeline")
 
-        self.logger.info(f"{'='*30}")
+        self.logger.info(f"{'='*60}")
         self.logger.info(f"Initializing Production Pipeline execution with the followning configurations")
         
         if(self.config.device == ''):
@@ -589,21 +594,29 @@ class ProductionPipeline:
                 self.label2idx = json.load(f)
                 self.num_classes = len(self.label2idx)
                 self.idx2label = {v: k for k, v in self.label2idx.items()}
-                self.logger.info(f"Loaded label mapping with {self.num_classes} classes")
+                self.logger.info(f"Loaded label mapping with {self.num_classes} classes from {self.config.label2idx_path}")
+                self.logger.info(f"Label2Idx Mapping: {self.label2idx}")
 
         except FileNotFoundError:
             self.logger.error(f"Label mapping file not found: {self.config.label2idx_path}")
             self.logger.info(f"{'='*30}")
             exit(1)
+
+        # get model_class from MODEL_DICT
+        #model_id = self.config.baseline_model_id
+        #self.model_class = MODELS_DICT.get(model_id, {}).get('class', None)
+        self.production_model = None
+        self.last_update_datasets = {}
+        self.last_update_dataloaders ={}
         
-        # Components
+        
         self.production_datasets = {} # in-distribution and out-of-distribution datasets within a year
         self.production_dataloaders = {}
 
         self.uncertain_datasets = {}
         self.uncertain_dataloaders = {}
         
-        self.production_model = None
+        
         self.confidence_estimator = None
         self.production_evaluator = None
         self.fine_tuner = None
@@ -611,12 +624,47 @@ class ProductionPipeline:
         self.confidence_threshold = self.config.confidence_threshold  # default confidence threshold for monitoring
         self.performance_history = []
         self.retraining_history = []
-        self.retraining_interval = self.config.retraining_interval  # in months
+        #self.retraining_interval = self.config.retraining_interval  # in months
 
         self.current_dataset = []
         self.current_dataloader = None
-        self.logger.info(f"{'='*30}")
+        self.logger.info(f"{'='*60}")
 
+        # set default metrics for monitoring for all datasets   
+        
+
+        self.interval_metrics = {
+            # save time info
+            'current_year_month': "",
+            'last_update_year_month': "",  # last update year and month
+
+            # save number of samples
+            'num_new_samples': 0,  # number of samples in the current production dataset (in distribution)
+            # number of uncertain samples detected
+            'num_uncertain_samples': 0,  # number of uncertain samples detected in in-distribution production set
+
+            # Supervised Metrics for evaluation of production simulation
+            # pre fine-tuning metrics 
+            'pre_finetune' : {
+                'in_loc': {'accuracy': 0.0, 'f1_weighted': 0.0, 'f1_macro':0.0},
+                'out_loc': {'accuracy': 0.0, 'f1_weighted': 0.0, 'f1_macro':0.0},
+            },
+            
+            # post fine-tuning metrics on current data
+            'post_finetune': {  # metrics after fine-tuning
+                'in_loc': {'accuracy': 0.0, 'f1_weighted': 0.0, 'f1_macro':0.0},
+                'out_loc': {'accuracy': 0.0, 'f1_weighted': 0.0, 'f1_macro':0.0},
+            },
+
+            # post fine-tuning metrics on previous data
+            'post_finetune_prev_data': {  # metrics after fine-tuning on previous data
+                'in_loc': {'accuracy': 0.0, 'f1_weighted': 0.0, 'f1_macro':0.0},
+                'out_loc': {'accuracy': 0.0, 'f1_weighted': 0.0, 'f1_macro':0.0},
+            },
+            
+        }
+
+    
 
     def setup_production_data(self):
         """Setup production-like dataset"""
@@ -627,24 +675,35 @@ class ProductionPipeline:
         # in_loc is the in-distribution dataset, out_loc is the out-of-distribution dataset
         # in_loc will be used for inference, confidence estimation, monitoring, and fine-tuning
         # out_loc will be used entirely for model evaluation and monitoring
+        in_loc_data_path = f'{self.config.new_data_dir}/in-loc-meta.csv'
         self.production_datasets['in_loc'] = S3ImageWithTimeFeatureDataset(
-            csv_path = self.config.production_data_path, 
+            csv_path = in_loc_data_path, 
             #label2idx_path = self.config.label2idx_path,
             label2idx = self.label2idx,  # use the loaded label2idx mapping
             images_path = self.config.preprocessed_images_path,
         )
+        self.interval_metrics['num_new_samples'] = len(self.production_datasets['in_loc'])
+        # get max year-month from last_update in loc
+        tmp_df = self.production_datasets['in_loc'].df.copy()
+        tmp_df['date_captured'] = pd.to_datetime(tmp_df['date_captured'])
+        max_date = tmp_df['date_captured'].max()
+        self.interval_metrics['current_year_month'] = max_date.strftime('%Y-%m')
+        self.logger.info(f"Loaded in-location data from current time interval {in_loc_data_path}")
+        
+        out_loc_data_path = f'{self.config.new_data_dir}/out-loc-meta.csv'
         self.production_datasets['out_loc'] = S3ImageWithTimeFeatureDataset(
-            csv_path = self.config.production_ood_data_path, 
+            csv_path = out_loc_data_path, 
             #label2idx_path = self.config.label2idx_path,
             label2idx = self.label2idx,  # use the loaded label2idx mapping
             images_path = self.config.preprocessed_images_path,
         )
-        self.production_datasets['cal'] = S3ImageWithTimeFeatureDataset(
-            csv_path = self.config.calibration_data_path, 
-            #label2idx_path = self.config.label2idx_path,
-            label2idx = self.label2idx,  # use the loaded label2idx mapping
-            images_path = self.config.preprocessed_images_path,
-        )
+        self.logger.info(f"Loaded out-location data from current time interval {out_loc_data_path}")
+        #self.production_datasets['cal'] = S3ImageWithTimeFeatureDataset(
+        #    csv_path = self.config.calibration_data_path, 
+        #    #label2idx_path = self.config.label2idx_path,
+        #    label2idx = self.label2idx,  # use the loaded label2idx mapping
+        #    images_path = self.config.preprocessed_images_path,
+        #)
 
         self.logger.info("Setting up dataloaders for production...")
 
@@ -657,18 +716,105 @@ class ProductionPipeline:
                 self.production_datasets['out_loc'], 
                 batch_size=self.config.inference_batch_size
             ),
-            'cal': torch.utils.data.DataLoader(
-                self.production_datasets['cal'], 
-                batch_size=self.config.inference_batch_size
-            ),
+            #'cal': torch.utils.data.DataLoader(
+            #    self.production_datasets['cal'], 
+            #    batch_size=self.config.inference_batch_size
+            #),
         }
         
             
         self.logger.info(f"Production (in loc) dataset loaded: {len(self.production_datasets['in_loc'])} samples")
         self.logger.info(f"Production (out loc) dataset loaded: {len(self.production_datasets['out_loc'])} samples")
-        self.logger.info(f"Calibration dataset loaded: {len(self.production_datasets['cal'])} samples")
+        #self.logger.info(f"Calibration dataset loaded: {len(self.production_datasets['cal'])} samples")
             
+    def load_most_recent_model_state_and_data(self):
+
+        """Load the most recent model state and data from last update directory"""
+        self.logger.info(f"Loading most recent model state and data from {self.config.last_update_data_dir}")
         
+        # Load the most recent model weights, .pth must have checkpoint name 'best_model.pth' with m
+        try:
+            # get deployed model class from baseline model id
+            model_id = self.config.baseline_model_id
+            model_config = self.config.model_configs[model_id].copy()
+            
+            model_class = model_config.pop('class')
+            
+            #model_class = model_config.pop('class')
+            self.logger.info(f"Loading model class: {model_class.__name__} for baseline model ID: {model_id}")
+            model = model_class(**model_config)
+
+            model_path = Path(self.config.last_update_data_dir) / "best_model.pth"
+
+            model.load_state_dict(torch.load(model_path, map_location=self.config.device))
+            self.production_model = model
+            self.production_model.to(self.config.device)
+            self.production_model.eval()
+
+            
+            #self.production_model = torch.load(model_path, map_location=self.config.device)
+            self.logger.info(f"Loaded model weights from {model_path}")
+        except FileNotFoundError:
+            self.logger.error(f"Model weights file not found: {model_path}")
+            raise
+        
+        # load calibration data and create dataloader
+        try:
+            cal_data_path = f'{self.config.last_update_data_dir}/cal-meta.csv'
+            self.last_update_datasets['cal'] = S3ImageWithTimeFeatureDataset(
+                csv_path=cal_data_path, 
+                label2idx=self.label2idx,  # use the loaded label2idx mapping
+                images_path=self.config.preprocessed_images_path,
+            )
+            self.logger.info(f"Loaded calibration data from previous time interval {cal_data_path}")
+            
+            in_loc_data_path = f'{self.config.last_update_data_dir}/in-loc-meta.csv'
+            self.last_update_datasets['in_loc'] = S3ImageWithTimeFeatureDataset(
+                csv_path=in_loc_data_path, 
+                label2idx=self.label2idx,  # use the loaded label2idx mapping
+                images_path=self.config.preprocessed_images_path,
+            )
+            self.logger.info(f"Loaded in-location data from previous time interval {in_loc_data_path}")
+
+            # get max year-month from last_update in loc
+            tmp_df = self.last_update_datasets['in_loc'].df.copy()
+            tmp_df['date_captured'] = pd.to_datetime(tmp_df['date_captured'])
+            max_date = tmp_df['date_captured'].max()
+            self.interval_metrics['last_update_year_month'] = max_date.strftime('%Y-%m')
+
+            out_loc_data_path = f'{self.config.last_update_data_dir}/out-loc-meta.csv'
+            self.last_update_datasets['out_loc'] = S3ImageWithTimeFeatureDataset(
+                csv_path=out_loc_data_path, 
+                label2idx=self.label2idx,  # use the loaded label2idx mapping
+                images_path=self.config.preprocessed_images_path,
+            )
+            self.logger.info(f"Loaded out-location data from previous time interval {out_loc_data_path}")
+            
+            # create dataloaders for the last update datasets
+            self.last_update_dataloaders['cal'] = torch.utils.data.DataLoader(
+                self.last_update_datasets['cal'], 
+                batch_size=self.config.inference_batch_size
+            )
+            self.last_update_dataloaders['in_loc'] = torch.utils.data.DataLoader(
+
+                self.last_update_datasets['in_loc'], 
+                batch_size=self.config.inference_batch_size
+            )
+            self.last_update_dataloaders['out_loc'] = torch.utils.data.DataLoader(
+                self.last_update_datasets['out_loc'], 
+                batch_size=self.config.inference_batch_size
+            )
+            self.logger.info(f"Loaded last update datasets from {self.config.last_update_data_dir}")
+            self.logger.info(f"In-Distribution dataset size: {len(self.last_update_datasets['in_loc'])}")
+            self.logger.info(f"Out-Of-Distribution dataset size: {len(self.last_update_datasets['out_loc'])}")
+            self.logger.info(f"Calibration dataset size: {len(self.last_update_datasets['cal'])}")
+            self.logger.info(f"Last update dataloaders created successfully")
+
+        except FileNotFoundError:
+            self.logger.error(f"Mandatory dataset files not found in last update directory: {self.config.last_update_data_dir}")
+            self.logger.error("Ensure the last update directory contains 'in-loc-meta.csv', 'out-loc-meta.csv', and 'cal-meta.csv'")
+            self.logger.info(f"{'='*30}")
+            raise   
         
     def deploy_model(self, model: nn.Module, model_name: str):
         """Deploy model for production simulation"""
@@ -703,7 +849,7 @@ class ProductionPipeline:
             self.logger.info(f"Setup calibration data from validation set for this model...")
             # Setup calibration data for this model
             cal_evaluator = Evaluator(self.production_model, device=self.config.device,
-                      test_loader=self.production_dataloaders['cal'],
+                      test_loader=self.last_update_dataloaders['cal'],
                       label_mapping=self.label2idx)
             
             cal_pred_labels, cal_pred_probs, cal_true_labels, cal_pred_logits = cal_evaluator._predict_all()
@@ -718,12 +864,52 @@ class ProductionPipeline:
             cal_correctness = (cal_pred_labels == cal_true_labels).astype(int)
             tva_hb_calibrator = tva_hb_calibrator.fit(cal_orig_confidences, cal_correctness)
             self.confidence_estimator = tva_hb_calibrator
-            self.logger.info(f"Confidence estimation setup complete - Method: TvAHistogramBinning with {n_bins} bins")
+            self.logger.info(f"Confidence Calibration complete - Method: TvAHistogramBinning with {n_bins} bins")
             
         except Exception as e:
             self.logger.error(f"Failed to setup confidence estimation: {e}")
             raise
 
+    def _evaluate_model_on_dataloader(self, model: nn.Module,
+                                      meta_df: pd.DataFrame, 
+                                      dataloader: torch.utils.data.DataLoader) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Evaluate model on a given dataloader"""
+        self.logger.info(f"Evaluating model on dataloader...")
+        evaluator = Evaluator(model, device=self.config.device,
+                      test_loader=dataloader,
+                      label_mapping=self.label2idx)
+        
+        pred_labels, pred_probs, true_labels, pred_logits = evaluator._predict_all()
+
+        
+
+        # Run TvA Confidence Estimation using calibrated confidence estimator
+        self.logger.info("Adjusting Confidence Scores via TvA to identify uncertain predictions...")
+        if(self.confidence_estimator is None):
+            self.setup_confidence_estimation()
+
+        orig_confidences = np.max(pred_probs, axis=1)
+        calibrated_confidences = self.confidence_estimator.transform(orig_confidences)
+        uncertainty_mask = calibrated_confidences < self.confidence_threshold
+        num_annotations = uncertainty_mask.sum()
+        self.logger.info(f"Found {uncertainty_mask.sum()} uncertain samples ({uncertainty_mask.sum()/len(pred_labels)*100:.1f}%)")
+
+        # Calculate supervised performance metrics for evaluation during production simulation
+        accuracy = accuracy_score(true_labels,pred_labels)
+        f1_weighted = f1_score(true_labels, pred_labels, average='weighted') # majority class biased
+        f1_macro = f1_score(true_labels, pred_labels, average='macro') # macro-averaged F1 score
+        self.logger.info(f"simulation debug: Accuracy: {accuracy:.4f}, F1 (weighted): {f1_weighted:.4f}, F1 (macro): {f1_macro:.4f}")
+
+        # add results to the dataset df for futher analysis and save to output dir
+        idx2label = self.idx2label
+        meta_df['pred_label'] = [idx2label[label] for label in pred_labels]
+        meta_df['orig_confidence'] = orig_confidences
+        meta_df['calibrated_confidence'] = calibrated_confidences
+        meta_df['uncertainty_mask'] = uncertainty_mask
+        
+        #meta_df
+        self.logger.info(f"Model evaluation complete on this dataset.")
+        return meta_df, accuracy, f1_weighted, f1_macro, num_annotations
     
         
     def run_production_simulation(self) -> Dict[str, Any]:
@@ -732,122 +918,106 @@ class ProductionPipeline:
         
         try:
             # Production evaluation
-            self.production_evaluator = Evaluator(self.production_model, device=self.config.device,
-                      test_loader=self.production_dataloaders['in_loc'],
-                      label_mapping=self.label2idx)
 
-            # Run batch inference on production data using Evaluator
-            self.logger.info("Runnning Batch Inference on Production Data")
-            pred_labels, pred_probs, true_labels, pred_logits = self.production_evaluator._predict_all()
-            
-            # Calculate performance metrics for evaluation purpose only
-            accuracy = accuracy_score(
-                true_labels,
-                pred_labels
+            # Step 1. Run batch inference and evaluation on in-location production data using current model
+            self.logger.info("....Prod Step 1: Runnning Batch Inference on in- location Production Data")
+            _, accuracy, f1_weighted, f1_macro, num_uncertain_samples = self._evaluate_model_on_dataloader(
+                model = self.production_model, 
+                dataloader = self.production_dataloaders['in_loc'],
+                meta_df = self.production_datasets['in_loc'].df
             )
-
-            self.production_evaluator2 = Evaluator(self.production_model, device=self.config.device,
-                      test_loader=self.production_dataloaders['out_loc'],
-                      label_mapping=self.label2idx)
-
-            # Run batch inference on production data using Evaluator
-            self.logger.info("Runnning Batch Inference on OOD Production Data")
-            pred_labels2, pred_probs2, true_labels2, pred_logits2 = self.production_evaluator2._predict_all()
+            save_path = f"{self.config.tmp_output_dir}/prev_model_inloc_preds.csv"
+            self.production_datasets['in_loc'].df.to_csv(save_path,index=False)
             
-            # Calculate performance metrics for evaluation purpose only
-            accuracy2 = accuracy_score(
-                true_labels2,
-                pred_labels2
+            #self.interval_metrics['num_uncertain_samples'] = num_uncertain_samples
+            self.interval_metrics['pre_finetune']['in_loc'] = {
+                'accuracy': accuracy,
+                'f1_weighted': f1_weighted,
+                'f1_macro': f1_macro,
+            }
+
+            # Step 2. Run batch inference and evaluation on out-location production data using current model
+            self.logger.info("....Prod Step 2: Runnning Batch Inference on out- location Production Data")
+            _, accuracy, f1_weighted, f1_macro ,_ = self._evaluate_model_on_dataloader(
+                model = self.production_model, 
+                dataloader = self.production_dataloaders['out_loc'],
+                meta_df = self.production_datasets['out_loc'].df
             )
+            save_path = f"{self.config.tmp_output_dir}/prev_model_outloc_preds.csv"
+            self.production_datasets['out_loc'].df.to_csv(save_path,index=False)
+            self.interval_metrics['pre_finetune']['out_loc'] = {
+                'accuracy': accuracy,
+                'f1_weighted': f1_weighted,
+                'f1_macro': f1_macro,
+            }
             
-            self.logger.info(f"Current model accuracy on ID: {accuracy:.4f}")
-            self.logger.info(f"Current model accuracy on OOD: {accuracy2:.4f}")
-
-            # Run TvA Confidence Estimation using calibrated confidence estimator
-            self.logger.info("Estimating confidence scores for production data...")
-            if(self.confidence_estimator is None):
-                self.setup_confidence_estimation()
-
-            orig_confidences = np.max(pred_probs, axis=1)
-            calibrated_confidences = self.confidence_estimator.transform(orig_confidences)
-            uncertainty_mask = calibrated_confidences < self.confidence_threshold
-
-            # add results to the dataset df for futher analysis
-            idx2label = {v: k for k, v in self.label2idx.items()}
-            self.production_datasets['in_loc'].df['pred_label'] = [idx2label[label] for label in pred_labels]
-            self.production_datasets['in_loc'].df['orig_confidence'] = orig_confidences
-            self.production_datasets['in_loc'].df['calibrated_confidence'] = calibrated_confidences
-            self.production_datasets['in_loc'].df['uncertainty_mask'] = uncertainty_mask
-
-            # save the results to a csv file, use os make dirs if necessary
-            self.production_datasets['in_loc'].df.to_csv(
-                self.config.production_predictions_path,
-                index=False
-            )
-            self.logger.info(f"Production meta-data with predictions, confidences, and uncertainty saved to {self.config.production_predictions_path}")
-            # show some statistics
-            self.logger.info(f"Found {uncertainty_mask.sum()} uncertain samples ({uncertainty_mask.sum()/len(self.production_datasets['in_loc'].df)*100:.1f}%)")
-            #self.logger.info(f"Evaluating confidence metrics on out-of-distribution test set...")
-            #confidence_results = self.confidence_estimator.estimate_batch_confidence(
-            #    self.production_dataloader
-            #)
-            self.logger.info("Preparing Dataset for Human Annotation...")
+            # Step 3. Get uncertain samples from in-location production data
+            self.logger.info("... Prod Step 3: Preparing Dataset for Human Annotation...")
             self._prepare_dataset_for_fine_tuning()
 
-            self.logger.info("Fine Tune Model on Newly Annotated Uncertain Samples...")
+            # Step 4. Fine-tune model only on uncertain samples, using ground true labels as 'human annotations'
+            self.logger.info("... Prod Step 4: Fine-Tuning Model on Uncertain Samples (Annotated)...")
             self._fine_tune_model()
-            # Monitoring simulation
-            #monitoring_results = self._simulate_monitoring()
-            pred_labels, pred_probs, true_labels, pred_logits = self.production_evaluator._predict_all()
-            # Calculate performance metrics
-            fine_tuned_accuracy = accuracy_score(
-                true_labels,
-                pred_labels
-            )
-            pred_labels2, pred_probs2, true_labels2, pred_logits2 = self.production_evaluator2._predict_all()
-            # Calculate performance metrics
-            fine_tuned_accuracy2 = accuracy_score(
-                true_labels2,
-                pred_labels2
-            )
             
-            self.logger.info(f"Fine-Tuned accuracy on ID: {fine_tuned_accuracy:.4f}")
-            self.logger.info(f"Fine-Tuned accuracy on OOD: {fine_tuned_accuracy2:.4f}")
-            # Log results
-            improvement = fine_tuned_accuracy - accuracy
-            improvement2 = fine_tuned_accuracy2 - accuracy2
-            #logger.info(f"Retrained model accuracy: {retrained_accuracy:.4f}")
-            self.logger.info(f"Improvement on ID: {improvement:.4f}")
-            self.logger.info(f"Improvement on OOD: {improvement2:.4f}")
+            # Step 5. Re-evaluate fine-tuned model on in-location production data
+            self.logger.info("... Prod Step 5: Re-Evaluating Fine-Tuned Model on In-Location Production Data")
+            _, accuracy, f1_weighted, f1_macro,_ = self._evaluate_model_on_dataloader(
+                model = self.production_model, 
+                dataloader = self.production_dataloaders['in_loc'],
+                meta_df = self.production_datasets['in_loc'].df
+            )
+            save_path = f"{self.config.tmp_output_dir}/new_model_inloc_preds.csv"
+            self.production_datasets['in_loc'].df.to_csv(save_path,index=False)
+            self.interval_metrics['post_finetune']['in_loc'] = {
+                'accuracy': accuracy,
+                'f1_weighted': f1_weighted,
+                'f1_macro': f1_macro,
+            }
 
-            
-            # Store performance history
-            #self.performance_history.append({
-            #    'year_month': current_year_month,-
-            #    'rolling_window_start': window_data['year_month'].min(),
-            #    'rolling_window_end': current_year_month,
-            #    'original_accuracy': accuracy,
-            #    'retrained_accuracy': retrained_accuracy,
-            #    'improvement': improvement,
-            #    'uncertain_samples_count': len(uncertain_samples),
-            #    'retraining_samples_count': len(retraining_data),
-            #    'train_samples_count': len(retrain_train),
-            #    'val_samples_count': len(retrain_val),
-            #    'split_method': 'stratified',
-            #    'retrain_train_samples': len(retrain_train),
-            #    'retrain_val_samples': len(retrain_val)
-            #})
-            
-            # Save checkpoint
-            #checkpoint_path = f"model_{current_year_month.replace('-', '_')}.pth"
-            #torch.save({
-            #    'model_state_dict': self.model.state_dict(),
-            #    'class_mapping': self.class_mapping,
-            #    #'calibrator_temperature': self.calibrator.temperature,
-            #    'year_month': current_year_month,
-            #    'accuracy': retrained_accuracy
-            #}, checkpoint_path)
-            
+            # Step 6. Re-evaluate fine-tuned model on out-location production data
+            self.logger.info("... Prod Step 6: Re-Evaluating Fine-Tuned Model on Out-Location Production Data")
+            _, accuracy, f1_weighted, f1_macro,_ = self._evaluate_model_on_dataloader(
+                model = self.production_model, 
+                dataloader = self.production_dataloaders['out_loc'],
+                meta_df = self.production_datasets['out_loc'].df
+            )
+            save_path = f"{self.config.tmp_output_dir}/new_model_outloc_preds.csv"
+            self.production_datasets['out_loc'].df.to_csv(save_path,index=False)
+            self.interval_metrics['post_finetune']['out_loc'] = {
+                'accuracy': accuracy,
+                'f1_weighted': f1_weighted,
+                'f1_macro': f1_macro,
+            }
+
+            # Step 7. Re-evaluate fine-tuned model on in-location production data in the previous time interval
+            self.logger.info("... Prod Step 7: Re-Evaluating Fine-Tuned Model on previous in-Location Production Data")
+            _, accuracy, f1_weighted, f1_macro,_  = self._evaluate_model_on_dataloader(
+                model = self.production_model, 
+                dataloader = self.last_update_dataloaders['in_loc'],
+                meta_df = self.last_update_datasets['in_loc'].df
+            )
+            save_path = f"{self.config.tmp_output_dir}/new_model_prev_inloc_preds.csv"
+            self.last_update_datasets['in_loc'].df.to_csv(save_path,index=False)
+            self.interval_metrics['post_finetune_prev_data']['in_loc'] = {
+                'accuracy': accuracy,
+                'f1_weighted': f1_weighted,
+                'f1_macro': f1_macro,
+            }
+
+            # Step 8. Re-evaluate fine-tuned model on out-location production data in the previous time interval
+            self.logger.info("... Prod Step 8: Re-Evaluating Fine-Tuned Model on previous out-Location Production Data")
+            _, accuracy, f1_weighted, f1_macro,_  = self._evaluate_model_on_dataloader(
+                model = self.production_model, 
+                dataloader = self.last_update_dataloaders['out_loc'],
+                meta_df = self.last_update_datasets['out_loc'].df
+            )
+            save_path = f"{self.config.tmp_output_dir}/new_model_prev_outloc_preds.csv"
+            self.last_update_datasets['out_loc'].df.to_csv(save_path,index=False)
+            self.interval_metrics['post_finetune_prev_data']['out_loc'] = {
+                'accuracy': accuracy,
+                'f1_weighted': f1_weighted,
+                'f1_macro': f1_macro,
+            }
             
             return {
              #   'production_metrics': prod_results,
@@ -859,17 +1029,44 @@ class ProductionPipeline:
             self.logger.error(f"Production simulation failed: {e}")
             raise
 
+    def _freeze_layers_strategy(self, freeze_resnet=True, freeze_time_processor=True):
+        """
+        Freeze ResNet18 and time processing layers, keep fusion + classifier trainable
+        """
+        # Freeze ResNet18 layers
+        if freeze_resnet:
+            for param in self.production_model.cnn.parameters():
+                param.requires_grad = False
+            print("✓ ResNet18 layers frozen")
+        
+        # Freeze time processing layers
+        if freeze_time_processor:
+            for param in self.production_model.time_project.parameters():
+                param.requires_grad = False
+            print("✓ Time processor layers frozen")
+        
+        # Keep fusion and classifier layers trainable (they remain requires_grad=True by default)
+        print("✓ Fusion and classifier layers remain trainable")
+        
+        return 
+
     def _fine_tune_model(self):
         """Fine tune the deployed model """
 
         self.logger.info("Freezing Early Layers...")
         # Freeze early layers for fine-tuning
-        for name, param in self.production_model.named_parameters():
-            if 'layer4' not in name and 'fc' not in name:
-                param.requires_grad = False
-            else:
-                self.logger.info(f"Unfreezing layer: {name}")
-                param.requires_grad = True
+
+        if self.config.baseline_model_id == 8:
+            self._freeze_layers_strategy(freeze_resnet=True, freeze_time_processor=True)
+        else:
+
+
+            for name, param in self.production_model.named_parameters():
+                if 'layer4' not in name and 'fc' not in name:
+                    param.requires_grad = False
+                else:
+                    self.logger.info(f"Unfreezing layer: {name}")
+                    param.requires_grad = True
         
         
         self.logger.info("Model Fine-Tuning Started...")
@@ -897,17 +1094,17 @@ class ProductionPipeline:
         # Dump training results to config training_output_dir, using os and makedirs
         # create subdirectory for each model using model_id
         # get model_id from the model name
-        output_dir = Path(self.config.training_output_dir) / f"model_{self.production_model.name}"
-        output_dir.mkdir(parents=True, exist_ok=True)
         # Save model state
-        model_save_path = output_dir / f"best_model.pth"
+        #model_save_path = output_dir / f"best_model.pth"
+        model_save_path = f"{self.config.tmp_output_dir}/best_model.pth"
         torch.save(trainer.best_model_weights, model_save_path)
         # dump learning history to json
-        history_save_path = output_dir / f"training_history.json"
+        history_save_path = f"{self.config.tmp_output_dir}/fine_tuning_history.json"
+        
         with open(history_save_path, 'w') as f:
             json.dump(trainer.training_history, f, indent=4)
         #self.logger.info(f"Model No {model_id} : {model.name} saved to {model_save_path}")
-        self.logger.info(f"Training history saved to {history_save_path}")
+        self.logger.info(f"FineTuning history saved to {history_save_path}")
 
         # plot loss and accuracy curves
         trainer.plot_metrics()
@@ -928,6 +1125,7 @@ class ProductionPipeline:
             self.logger.warning("No uncertain samples found for fine-tuning.")
             return pd.DataFrame(), pd.DataFrame()
         self.logger.info(f"Found {len(uncertain_data)} uncertain samples for fine-tuning.")
+        self.interval_metrics['num_uncertain_samples'] = len(uncertain_data)
         
         # Split uncertain samples into training and validation sets
         train_uncertain, val_uncertain = self._stratified_uncertain_samples_split(uncertain_data)
@@ -948,12 +1146,12 @@ class ProductionPipeline:
         self.uncertain_dataloaders = {
             'train': torch.utils.data.DataLoader(
                 self.uncertain_datasets['train'], 
-                batch_size=self.config.batch_size, 
+                batch_size=self.config.fine_tune_batch_size, 
                 shuffle=True
             ),
             'val': torch.utils.data.DataLoader(
                 self.uncertain_datasets['val'], 
-                batch_size=self.config.batch_size
+                batch_size=self.config.fine_tune_batch_size
             )
         }
         
@@ -1013,38 +1211,86 @@ class ProductionPipeline:
         
         return train_uncertain, val_uncertain
         
-    def _simulate_monitoring(self) -> Dict[str, Any]:
-        """Simulate production monitoring"""
-        self.logger.info("Simulating production monitoring...")
+    
+
+    def _update_calibration_data(self, annotated_new_samples: pd.DataFrame = None):
+        """Update calibration data with uncertain samples"""
+
+        # merge calibration df with uncertain samples df
+        prev_cal_df = self.last_update_datasets['cal'].df.copy()
         
-        try:
-            # Simulate various production scenarios
-            monitoring_results = {
-                'latency_tests': self._test_inference_latency(),
-                'memory_usage': self._test_memory_usage(),
-                'throughput': self._test_throughput(),
-                'drift_detection': self._test_data_drift()
-            }
-            
-            return monitoring_results
-            
-        except Exception as e:
-            self.logger.error(f"Monitoring simulation failed: {e}")
-            raise
-        
-    def run_pipeline(self, model: nn.Module, model_name: str) -> Dict[str, Any]:
+        if annotated_new_samples is None:
+            self.logger.info("No specific annotated new samples provided, using uncertain samples from production data")
+            # Use uncertain samples from production data
+            uncertain_samples = self.production_datasets['in_loc'].df[self.production_datasets['in_loc'].df['uncertainty_mask']]
+            if len(uncertain_samples) == 0: 
+                self.logger.warning("No uncertain samples found in production data for calibration update")
+                return prev_cal_df
+            self.logger.info(f"Found {len(uncertain_samples)} uncertain samples in production data for calibration update")
+            # concatenate previous calibration data with uncertain samples
+            new_cal_df = pd.concat([prev_cal_df, uncertain_samples], axis=0, ignore_index=True)
+            # sort new_cal_df by timestamp, and filter only the last 12 months of data
+            new_cal_df['date_captured'] = pd.to_datetime(new_cal_df['date_captured'], errors='coerce')
+            new_cal_df = new_cal_df.sort_values(by='date_captured', ascending=True)
+            new_cal_df = new_cal_df[new_cal_df['date_captured'] >= (new_cal_df['date_captured'].max() - pd.DateOffset(months=12))]
+
+            # save new calibration data to csv
+            new_cal_df.to_csv(f"{self.config.tmp_output_dir}/cal-meta.csv", index=False)
+
+            return new_cal_df
+
+    
+    def run_pipeline(self) -> Dict[str, Any]:
         """Run the complete production pipeline"""
         self.logger.info("🚀 Starting Production Pipeline...")
         
         try:
             # Setup production environment
+            self.load_most_recent_model_state_and_data()
             self.setup_production_data()
-            self.deploy_model(model, model_name)
+            #self.deploy_model(model, model_name)
             self.setup_confidence_estimation()
             
             # Run simulation
-            results = self.run_production_simulation()
+            self.run_production_simulation()
+
+            # save monitoring results as json
+            summary_metrics = self.interval_metrics.copy()
+            json_path = f"{self.config.tmp_output_dir}/summary_metrics.json"
+            with open(json_path, 'w') as f:
+                json.dump(summary_metrics, f, indent=4)
+
+            # create new calibration data by combining uncertain samples and previous calibration data
+            self._update_calibration_data()
+
+            # zip the tmp output directory
+            import shutil
+            zip_path = f"{self.config.historical_data_dir}/production_results_{self.interval_metrics['current_year_month']}.zip"
+            shutil.make_archive(zip_path.replace('.zip', ''), 'zip', self.config.tmp_output_dir)
+            self.logger.info(f"Production pipeline results saved to {zip_path}")
+
+            # remove all files in last_update_data_dir
+            #self.logger.info(f"Removing all files in last update data directory {self.config.last_update_data_dir}")
+            shutil.rmtree(self.config.last_update_data_dir, ignore_errors=True)
+            # copy best_model.pth and cal-meta.csv from tmp_output_dir to last_update_data_dir
+            self.logger.info(f"Copying best model and calibration data to last update directory {self.config.last_update_data_dir}")
+            import os
+            os.makedirs(self.config.last_update_data_dir, exist_ok=True)
+            shutil.copy(f"{self.config.tmp_output_dir}/best_model.pth", self.config.last_update_data_dir)
+            shutil.copy(f"{self.config.tmp_output_dir}/cal-meta.csv", self.config.last_update_data_dir)
+
+            # copy new data to last update data directory
+            self.logger.info(f"Copying new in-loc and out-loc data to last update directory {self.config.last_update_data_dir}")
+            shutil.copy(f"{self.config.new_data_dir}/in-loc-meta.csv", self.config.last_update_data_dir)
+            shutil.copy(f"{self.config.new_data_dir}/out-loc-meta.csv", self.config.last_update_data_dir)
+            # remove new data dir/create a new one
+            self.logger.info(f"Removing new data directory {self.config.new_data_dir}")
+            shutil.rmtree(self.config.new_data_dir, ignore_errors=True)
+            os.makedirs(self.config.new_data_dir, exist_ok=True)
+            #shutil.rmtree(self.config.last_update_data_dir, ignore_errors=True)
+
             
+            #
             #results = self.periodic_retraining_simulation()
             # Assess deployment readiness
             #deployment_assessment = self.assess_deployment_readiness(results)
@@ -1053,7 +1299,7 @@ class ProductionPipeline:
             #self.logger.info(f"Production pipeline completed - "
             #               f"Deployment Ready: {deployment_assessment['deployment_ready']}")
             
-            return results
+            return self.interval_metrics
             
         except Exception as e:
             self.logger.error(f"Production pipeline failed: {e}")
